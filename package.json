@@ -1,0 +1,12 @@
+{
+  "name": "spiritsbox-app",
+  "version": "1.0.0",
+  "description": "SpiritsBox Flask Web App",
+  "main": "start.sh",
+  "scripts": {
+    "start": "bash start.sh"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
