@@ -17,3 +17,7 @@ app = "spiritsbox"  # Usa el nombre exacto creado en Fly.io
   [[services.ports]]
     handlers = ["tls", "http"]
     port = 443
+
+    [vm]
+    size = "shared-cpu-1x"  # 🧠 1 CPU
+    memory = 256            # o 256 si necesitas menos
