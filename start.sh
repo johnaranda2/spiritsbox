@@ -1,7 +1,8 @@
 #!/bin/bash
 
-echo "✅ Instalando dependencias..."
-pip install -r requirements.txt
+#!/bin/bash
+pip3 install -r requirements.txt
+python3 app.py
 
 echo "🚀 Iniciando la aplicación Flask..."
 export FLASK_APP=app.py

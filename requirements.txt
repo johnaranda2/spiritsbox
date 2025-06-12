@@ -1,5 +1,8 @@
-Flask>=2.2,<2.4
-pymongo>=4.5
+Flask==2.2.5
+pymongo
 scikit-learn>=1.3
-cohere>=4.0
+cohere
 openai>=1.0.0
+
+
+
