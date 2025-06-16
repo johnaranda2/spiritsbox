@@ -5,5 +5,5 @@ cohere
 openai>=1.0.0
 gunicorn
 flask_cors
-
+pandas
 
