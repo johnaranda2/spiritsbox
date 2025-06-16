@@ -8,7 +8,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 import pandas as pd
 from datetime import datetime
 import cohere
-import re
+import re, requests
+from bson import ObjectId
 
 app = Flask(__name__)
 CORS(app)
@@ -27,10 +28,47 @@ customers_col = db["customers"]
 drinks_col = db["drinks"]
 history_col = db["recommendation_history"]
 
+session_data = {}
+
 def build_profile_vector(prefix, items):
     return " ".join([f"{prefix}_{item}" for item in items])
 
 customer_bp = Blueprint("customers", __name__)
+
+def extraer_preferencias(texto):
+    texto = texto.lower()
+    tipos = []
+    sabores = []
+    origenes = []
+
+    posibles_tipos = ["beer", "wine", "whisky", "rum", "vodka", "brandy", "tequila", "cocktail", "gin"]
+    posibles_sabores = ["sweet", "bitter", "spicy", "smoky", "fruity", "floral", "herbal"]
+    posibles_origenes = ["mexico", "chile", "france", "scotland", "japan", "spain", "italy", "usa", "germany"]
+
+    for tipo in posibles_tipos:
+        if tipo in texto:
+            tipos.append(tipo)
+
+    for sabor in posibles_sabores:
+        if sabor in texto:
+            sabores.append(sabor)
+
+    for origen in posibles_origenes:
+        if origen in texto:
+            origenes.append(origen.capitalize())
+
+    return tipos, sabores, origenes
+
+@app.route("/test_cliente")
+def test_cliente():
+    nombre = "Amelia Martin"
+    cliente = customers_col.find_one({
+        "name": { "$regex": f"^{re.escape(nombre.strip())}$", "$options": "i" }
+    })
+    if cliente:
+        cliente["_id"] = str(cliente["_id"])  # 💡 CONVIERTE EL ObjectId A TEXTO
+        return jsonify({"encontrado": True, "datos": cliente})
+    return jsonify({"encontrado": False})
 
 @customer_bp.route("/api/customers", methods=["GET"])
 def get_customers():
@@ -60,81 +98,160 @@ def update_customer(name):
 def clientes_page():
     return render_template("clientes.html")
 
+@app.route("/web")
+def web():
+    return render_template("/web.html")
+
 @app.route("/recommendations_llm", methods=["POST"])
 def recommendations_llm():
     data = request.get_json()
     messages = data.get("messages", [])
-
-    # Detección del nombre desde los mensajes del usuario
     nombre = None
+
     patrones_nombre = [
-        r"soy ([a-zA-ZÀ-ÿ\s]+)",
+        r"my name is ([a-zA-ZÀ-ÿ\s]+)",
+        r"i[’']?m ([a-zA-ZÀ-ÿ\s]+)",
         r"me llamo ([a-zA-ZÀ-ÿ\s]+)",
-        r"mi nombre es ([a-zA-ZÀ-ÿ\s]+)"
+        r"mi nombre es ([a-zA-ZÀ-ÿ\s]+)",
+        r"soy ([a-zA-ZÀ-ÿ\s]+)"
     ]
+
     for msg in messages:
         if msg["role"] == "user":
             texto = msg["content"].strip()
             for patron in patrones_nombre:
                 match = re.search(patron, texto, re.IGNORECASE)
                 if match:
-                    nombre = match.group(1).strip()
+                    nombre = match.group(1).strip().title()
                     break
+            if not nombre and len(texto.split()) >= 2 and texto.replace(" ", "").isalpha():
+                nombre = texto.title()
         if nombre:
             break
 
-    # Prompt base (sin etiquetas de rol)
-    prompt = (
-        "You are SpiritsBot, the virtual advisor for alcoholic drinks at SpiritsBox. "
-        "Your role is to interact naturally with the client and guide them to find the best recommendations. "
-        "Please follow this logical flow:\n"
-        "1. Ask for the client's name if not known.\n"
-        "2. If name is known, check if registered.\n"
-        "3. If new, ask about preferences (type, flavor, origin).\n"
-        "4. If returning, list saved preferences and ask if they want to update.\n"
-        "5. Based on preferences, make personalized suggestions.\n"
-        "Be friendly, curious, and helpful. Don't label yourself as 'Assistant'. Don't include role tags.\n\n"
-    )
+    if not nombre:
+        return jsonify({"reply": "Hi! What's your name so I can help you with drink recommendations?"})
 
-    # Añadir información del cliente si fue identificado
-    if nombre:
-        cliente = customers_col.find_one({
-            "name": { "$regex": f"^{nombre}$", "$options": "i" }
-        })
+    nombre = nombre.strip()
 
-        if cliente:
-            prefs = cliente.get("preferences", {})
-            tipos = ", ".join(prefs.get("types", [])) or "not specified"
-            sabores = ", ".join(prefs.get("flavor_profiles", [])) or "not specified"
-            origenes = ", ".join(prefs.get("origins", [])) or "not specified"
-            prompt += (
-                f"The client is {nombre}, a returning user.\n"
-                f"Their preferences are:\n"
-                f"- Type: {tipos}\n"
-                f"- Flavor: {sabores}\n"
-                f"- Origin: {origenes}\n"
-                f"Ask if they want to update or receive new suggestions.\n\n"
+    # Preparar estado si no existe
+    if nombre not in session_data:
+        session_data[nombre] = {
+            "types": [],
+            "flavor_profiles": [],
+            "origins": [],
+            "actualizando": False
+        }
+
+    # Ver último mensaje
+    last_msg = messages[-1]["content"].strip().lower()
+
+    cliente = customers_col.find_one({ "name": { "$regex": f"^{re.escape(nombre)}$", "$options": "i" } })
+
+    # MODO ACTUALIZACIÓN
+    if session_data[nombre].get("actualizando", False):
+        tipos, sabores, origenes = extraer_preferencias(last_msg)
+        estado = session_data[nombre]
+        estado["types"] += [t for t in tipos if t not in estado["types"]]
+        estado["flavor_profiles"] += [s for s in sabores if s not in estado["flavor_profiles"]]
+        estado["origins"] += [o for o in origenes if o not in estado["origins"]]
+
+        if estado["types"] and estado["flavor_profiles"] and estado["origins"]:
+            customers_col.update_one(
+                { "name": { "$regex": f"^{re.escape(nombre)}$", "$options": "i" }},
+                { "$set": { "preferences": {
+                    "types": estado["types"],
+                    "flavor_profiles": estado["flavor_profiles"],
+                    "origins": estado["origins"]
+                }}}
             )
+            del session_data[nombre]
+            return jsonify({"reply": f"Thanks {nombre}, your preferences were updated. Would you like a new recommendation?"})
         else:
-            prompt += f"The client says their name is {nombre}, but they are new. Ask them about their preferences.\n\n"
+            faltantes = []
+            if not estado["types"]: faltantes.append("drink type (e.g., wine, beer)")
+            if not estado["flavor_profiles"]: faltantes.append("flavor (e.g., sweet, smoky)")
+            if not estado["origins"]: faltantes.append("origin (e.g., Chile, France)")
+            return jsonify({"reply": f"Got it. Please tell me your " + " and ".join(faltantes) + "."})
+
+    # ACTIVAR ACTUALIZACIÓN
+    if last_msg in ["yes", "sí", "i want to update", "update my preferences"]:
+        session_data[nombre] = {
+            "types": [],
+            "flavor_profiles": [],
+            "origins": [],
+            "actualizando": True
+        }
+        return jsonify({"reply": f"Sure, {nombre}. Let's update your preferences. What type of drinks do you enjoy?"})
+
+    if last_msg in ["no", "no thanks", "not now"]:
+        return jsonify({"reply": f"Alright, {nombre}. Let me know if you need anything else!"})
+
+    # CLIENTE YA EXISTE
+    if cliente:
+        prefs = cliente.get("preferences", {})
+        tipos = ", ".join(prefs.get("types", [])) or "not specified"
+        sabores = ", ".join(prefs.get("flavor_profiles", [])) or "not specified"
+        origenes = ", ".join(prefs.get("origins", [])) or "not specified"
+
+        try:
+            res = requests.get(f"http://localhost:5050/api/recommendations?name={nombre}")
+            recomendaciones = res.json() if res.ok else []
+        except Exception as e:
+            recomendaciones = []
+
+        lista_recs = "\n".join([
+            f"- {r['name']} ({r['type']}, {r['origin']}) — {round(r['similarity'] * 100)}%"
+            for r in recomendaciones[:3]
+        ])
+
+        return jsonify({"reply": (
+            f"Hi {nombre}, I found your preferences:\n"
+            f"• Type: {tipos}\n• Flavor: {sabores}\n• Origin: {origenes}\n\n"
+            f"Here are your top recommendations:\n{lista_recs}\n\n"
+            f"Would you like to update your preferences?"
+        )})
+
+    # CLIENTE NUEVO → recolectar paso a paso
+    tipos, sabores, origenes = extraer_preferencias(last_msg)
+    estado = session_data[nombre]
+    estado["types"] += [t for t in tipos if t not in estado["types"]]
+    estado["flavor_profiles"] += [s for s in sabores if s not in estado["flavor_profiles"]]
+    estado["origins"] += [o for o in origenes if o not in estado["origins"]]
+
+    if estado["types"] and estado["flavor_profiles"] and estado["origins"]:
+        customers_col.insert_one({
+            "name": nombre,
+            "preferences": estado,
+            "history": [],
+            "feedback": {},
+        })
+        del session_data[nombre]
+
+        try:
+            res = requests.get(f"http://localhost:5050/api/recommendations?name={nombre}")
+            recomendaciones = res.json() if res.ok else []
+        except Exception as e:
+            recomendaciones = []
+
+        lista_recs = "\n".join([
+            f"- {r['name']} ({r['type']}, {r['origin']}) — {round(r['similarity'] * 100)}%"
+            for r in recomendaciones[:3]
+        ])
+
+        return jsonify({"reply": (
+            f"Thanks {nombre}! I've saved your preferences:\n"
+            f"• Type: {', '.join(estado['types'])}\n"
+            f"• Flavor: {', '.join(estado['flavor_profiles'])}\n"
+            f"• Origin: {', '.join(estado['origins'])}\n\n"
+            f"Here are your top recommendations:\n{lista_recs}"
+        )})
     else:
-        prompt += "You don't know the client's name yet. Kindly ask them to start.\n\n"
-
-    # Agrega la conversación previa (sin 'Assistant:' ni 'User:')
-    for m in messages:
-        if m["role"] != "system":
-            prompt += f"{m['content']}\n"
-
-    # Llamada al modelo Cohere
-    try:
-        response = co.chat(
-            model="command-r",
-            message=prompt,
-            temperature=0.7
-        )
-        return jsonify({"reply": response.text})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        faltantes = []
+        if not estado["types"]: faltantes.append("drink type (e.g., wine, beer)")
+        if not estado["flavor_profiles"]: faltantes.append("flavor (e.g., sweet, smoky)")
+        if not estado["origins"]: faltantes.append("origin (e.g., Chile, France)")
+        return jsonify({"reply": f"Great, {nombre}! Could you tell me your " + " and ".join(faltantes) + "?"})
 
 
 
@@ -324,4 +441,4 @@ def recommend_all():
 
 app.register_blueprint(customer_bp)
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=3000)
+    app.run(debug=True, port=5050)
